@@ -1,0 +1,972 @@
+---
+---
+## only adult samples, 21 samples in all.
+## This CNV calculation version is for cell name containing sample names.
+## The expression matrix provided by these author is Eij actually. using Eij as the the input for seurat is better than using TPM.
+
+# Seurat workflow for GSE131928_GSM382867 (SmartSeq) 
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+## load packages
+```{r load packages}
+library(reticulate)
+library(loomR)
+library(dplyr)
+library(Seurat)
+library(patchwork)
+library(stringr)
+library(doParallel)
+library(parallel)
+library(org.Hs.eg.db)
+library(clusterProfiler)
+library(enrichplot)
+library(WGCNA)
+library(pheatmap)
+library(VennDiagram)
+library(entropy)
+library(ggplot2)
+options(digits=3)
+```
+
+## Read in input data
+```{r Read in input data}
+exp.mat <- read.table(file = "./GSM3828672_Smartseq2_GBM_IDHwt_processed_TPM.tsv", header = TRUE, as.is = TRUE, row.names = 1)# already log(TPM/10+1)
+glioma <- CreateSeuratObject(counts = exp.mat , project = "GSM3828672") #remove min.cells,min.features
+```
+## Add patient ID information
+```{r Add patient ID information}
+patient = read.table(file = "./patient_ID_col",header = FALSE)
+rownames(patient) <- patient$V1
+glioma$patient_ID <- patient$V2
+glioma<-subset(glioma,subset=(patient_ID %in% c("MGH100","MGH101","MGH102","MGH104","MGH105","MGH106","MGH110","MGH113", "MGH115","MGH121","MGH122","MGH124","MGH125","MGH128","MGH129","MGH136","MGH143","MGH151","MGH152","MGH66","MGH85")))
+glioma$patient_ID<-as.factor(as.character(glioma$patient_ID))
+glioma$new_patient_ID <- 'NA'
+j=1
+for (i in levels(glioma$patient_ID)){
+  glioma$new_patient_ID[glioma$patient_ID==i]<-paste("P",j)
+  j=j+1
+}
+```
+
+
+## check gene's biotype
+```{r}
+biotype<-read.table("./hg19/gtf_file/hg19.database_v3.gtf",sep="\t",header=T)
+rownames(biotype)<-biotype$gene_name
+```
+
+
+## Data quality control
+```{r Data quality control}
+# The [[ operator can add columns to object metadata. This is a great place to stash QC stats
+glioma[["percent.mt"]] <- PercentageFeatureSet(glioma, pattern = "^MT-")
+VlnPlot(glioma, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+plot1 <- FeatureScatter(glioma, feature1 = "nCount_RNA", feature2 = "percent.mt")
+plot2 <- FeatureScatter(glioma, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+plot1 + plot2
+glioma <- subset(glioma, subset = nFeature_RNA > 3000)#去除了原教程的两个参数:nFeature_RNA < 2500 & percent.mt < 5
+```
+
+## Identify highly varialbe genes
+```{r Identify highly varialbe genes}
+glioma <- FindVariableFeatures(glioma, selection.method = "vst", nfeatures = 2000)
+
+# Identify the 10 most highly variable genes
+top10 <- head(VariableFeatures(glioma), 10)
+
+# plot variable features with and without labels
+plot1 <- VariableFeaturePlot(glioma)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+```
+
+## Scaling the data using linear transformation (must before PCA)
+### purpose: This step gives equal weight in downstream analyses, so that highly-expressed genes do not dominate
+```{r Scaling the data using linear transformation}
+glioma <- ScaleData(glioma)
+```
+
+##  Perform linear  reduction
+```{r Perform linear  reduction}
+all.genes <- rownames(glioma)
+glioma <- RunPCA(glioma, features = VariableFeatures(object = glioma))
+# Examine and visualize PCA results a few different ways
+print(glioma[["pca"]], dims = 1:5, nfeatures = 5)
+VizDimLoadings(glioma, dims = 1:2, reduction = "pca")
+DimPlot(glioma, group.by = "patient_ID",reduction = "pca")
+DimHeatmap(glioma, dims = 1, cells = 500, balanced = TRUE)
+DimHeatmap(glioma, dims = 1:15, cells = 500, balanced = TRUE)
+```
+
+
+## Clustering cells and visualization
+```{r Clustering cells and visualization}
+ElbowPlot(glioma)
+glioma <- FindNeighbors(glioma, dims = 1:15)   # 15
+glioma <- FindClusters(glioma, resolution = 0.4)
+glioma <- RunUMAP(glioma, dims = 1:15)
+glioma <- RunTSNE(glioma,features = VariableFeatures(object = glioma))
+#DimPlot(glioma, group.by = "patient_ID", reduction = "tsne")
+glioma@meta.data$umap_clusters <-glioma@active.ident
+
+DimPlot(glioma, reduction = "tsne",group_by="umap_clusters",label=TRUE)+DimPlot(glioma, reduction = "tsne",group.by="patient_ID")
+
+
+a<-table(glioma@active.ident,glioma$patient_ID)
+t<-function(l){l/sum(l)}
+apply(a,2,t)
+apply(apply(a,2,t),2,function(x){ifelse(any(x>0.5),TRUE,FALSE)})
+b<-table(glioma$patient_ID,glioma@active.ident)
+write.csv(b,'./file/patient_cluster.csv')
+```
+
+
+## Calculation of binary expression  index for each gene, adopted from 2019Hodges
+```{r Calculation of binary expression  index for each gene}
+clusters<-glioma$umap_clusters
+Binary_Expression_Call<-function(x){
+  temp<-data.frame(cluster=clusters,expression=x)
+  len<-length(levels(clusters))
+  temp$judge<-as.numeric(x>0.5) # greater than backgroud level 1.
+  counts<-as.data.frame.matrix(table(temp$cluster,temp$judge)) # convert table to data.frame, and counts won't stored in column freq like as.data.frame.
+  if(!"0" %in% colnames(counts)){counts[["0"]]=rep(0,len)} # add 0 information
+  if(!"1" %in% colnames(counts)){counts[["1"]]=rep(0,len)} # add 0 information
+  proption<-counts[["1"]]/(counts[["0"]]+counts[["1"]])
+  mother<-0
+  son<-0
+  epison<-0.001
+  for(i in 1:len){
+    if(i==len){break}
+    for(j in (i+1):len){
+      #cat(i,j,proption[i],proption[j],"\n")
+      son=son+(proption[i]-proption[j])^2
+      mother=mother+abs(proption[i]-proption[j])
+      cat(i,j,mother,son,"\n")
+    }
+  }
+  mother=mother+epison
+  return(son/mother)
+}
+detectCores(logical=F) #phisical core
+cl<- makeCluster(20)
+#clusterEvalQ(cl,library(dplyr)) # add package used in parallel
+clusterExport(cl,"clusters") # add varilabe used in parallel
+system.time(Binary_Expression <- parApply(cl,glioma@assays$RNA@counts,1,Binary_Expression_Call))
+stopCluster(cl)
+
+BinaryMarkerSelection<-function(x,logFC_cutoff=2,q_cutoff=0.05,binary_cutoff=0.7){
+  x$binary_exression_index<-Binary_Expression[rownames(x)]
+  tmp<-x %>% filter(p_val_adj < q_cutoff & avg_logFC >logFC_cutoff & binary_exression_index > binary_cutoff)
+  #tmp<-x %>% filter(p_val_adj < q_cutoff, avg_logFC > logFC_cutoff,  binary_exression_index > binary_cutoff)
+  return(tmp)
+}
+```
+
+
+
+
+## Identify marker gene for cluster 3
+```{r identify marker genes for cluster 3}
+glioma.markers3 <- FindMarkers(glioma,ident.1=3,only.pos = TRUE, min.pct = 0, logfc.threshold = 0.5, test.use = "wilcox")
+markers3 <- rownames(glioma.markers3 %>% filter(p_val_adj<0.01 & abs(avg_logFC)>2)) 
+markers3_ENTREZID<-bitr(markers3,fromType = "SYMBOL",toType = "ENTREZID",OrgDb=org.Hs.eg.db)$ENTREZID
+
+cell_markers<-read.table("./Human_cell_markers_deduplicated_clusterProfiler.txt",sep="\t",header=T) #not exactly the same result as above vroom provided by Uncle Y.
+markers3.er<-enricher(gene=markers3_ENTREZID,TERM2GENE=cell_markers)
+
+barplot(markers3.er)  #microphage
+geneInCategory(markers3.er)[1]
+markers3.symbol<-bitr(geneInCategory(markers3.er)[[4]],fromType="ENTREZID",toType = "SYMBOL",OrgDb=org.Hs.eg.db)
+binarymarkers3<-BinaryMarkerSelection(glioma.markers3[markers3.symbol$SYMBOL,],binary_cutoff = 0.85)
+FeaturePlot(glioma,T_cells_list[[1]],reduction="tsne")
+
+```
+
+
+## Identify marker gene for cluster 11
+```{r identify marker genes for cluster 11}
+glioma.markers11 <- FindMarkers(glioma,ident.1=11,only.pos = TRUE, min.pct = 0, logfc.threshold = 0.5, test.use = "wilcox")
+markers11<- rownames(glioma.markers11 %>% filter(p_val_adj<0.01 & abs(avg_logFC)>2)) 
+markers11_ENTREZID<-bitr(markers11,fromType = "SYMBOL",toType = "ENTREZID",OrgDb=org.Hs.eg.db)$ENTREZID
+
+cell_markers<-read.table("./Human_cell_markers_deduplicated_clusterProfiler.txt",sep="\t",header=T) #not exactly the same result as above vroom provided by Uncle Y.
+markers11.er<-enricher(gene=markers11_ENTREZID,TERM2GENE=cell_markers)
+
+barplot(markers11.er) #Oligodendrocyte
+geneInCategory(markers11.er)[1]
+markers11.symbol<-bitr(geneInCategory(markers11.er)[[1]],fromType="ENTREZID",toType = "SYMBOL",OrgDb=org.Hs.eg.db)
+binarymarkers11<-BinaryMarkerSelection(glioma.markers11[markers11.symbol$SYMBOL,],binary_cutoff = 0.8)
+```
+
+
+
+
+## Identify marker gene for cluster 14
+```{r identify marker genes for cluster 14}
+glioma.markers14 <- FindMarkers(glioma,ident.1=14,only.pos = TRUE, min.pct = 0, logfc.threshold = 0.5, test.use = "wilcox")
+markers14 <- rownames(glioma.markers14 %>% filter(p_val_adj<0.01 & abs(avg_logFC)>2)) 
+#FeaturePlot(glioma,markers12,reduction="tsne")
+markers14_ENTREZID<-bitr(markers14,fromType = "SYMBOL",toType = "ENTREZID",OrgDb=org.Hs.eg.db)$ENTREZID
+
+cell_markers<-read.table("./Human_cell_markers_clusterProfiler.txt",sep="\t",header=T) #not exactly the same result as above vroom provided by Uncle Y.
+markers14.er<-enricher(gene=markers14_ENTREZID,TERM2GENE=cell_markers)
+
+barplot(markers14.er) # T cell
+geneInCategory(markers14.er)[1]
+markers14.symbol<-bitr(geneInCategory(markers14.er)[[1]],fromType="ENTREZID",toType = "SYMBOL",OrgDb=org.Hs.eg.db)
+binarymarkers14<-BinaryMarkerSelection(glioma.markers14[markers14.symbol$SYMBOL,],binary_cutoff = 0.8)
+#FeaturePlot(glioma,rownames(binarymarkers12),reduction="tsne")
+```
+
+## malignant
+## Identify marker gene for cluster 2
+```{r identify marker genes for cluster 2}
+glioma.markers2 <- FindMarkers(glioma,ident.1=2,only.pos = TRUE, min.pct = 0, logfc.threshold = 0.5, test.use = "wilcox")
+markers2 <- rownames(glioma.markers2 %>% filter(p_val_adj<0.01 & abs(avg_logFC)>1.5)) 
+#FeaturePlot(glioma,markers12,reduction="tsne")
+markers2_ENTREZID<-bitr(markers2,fromType = "SYMBOL",toType = "ENTREZID",OrgDb=org.Hs.eg.db)$ENTREZID
+
+cell_markers<-read.table("./Human_cell_markers_clusterProfiler.txt",sep="\t",header=T) #not exactly the same result as above vroom provided by Uncle Y.
+markers2.er<-enricher(gene=markers2_ENTREZID,TERM2GENE=cell_markers)
+
+barplot(markers2.er)
+geneInCategory(markers2.er)[3]
+markers2.symbol<-bitr(geneInCategory(markers2.er)[[3]],fromType="ENTREZID",toType = "SYMBOL",OrgDb=org.Hs.eg.db)
+binarymarkers2<-BinaryMarkerSelection(glioma.markers2[markers2.symbol$SYMBOL,],binary_cutoff = 0.8)
+FeaturePlot(glioma,rownames(binarymarkers2),reduction="tsne")
+```
+
+```{r Identify marker gene for cluster 4 }
+glioma.markers4 <- FindMarkers(glioma,ident.1=4,only.pos = TRUE, min.pct = 0, logfc.threshold = 0.5, test.use = "wilcox")
+markers4 <- rownames(glioma.markers4 %>% filter(p_val_adj<0.01 & abs(avg_logFC)>1.5)) 
+#FeaturePlot(glioma,markers12,reduction="tsne")
+markers4_ENTREZID<-bitr(markers4,fromType = "SYMBOL",toType = "ENTREZID",OrgDb=org.Hs.eg.db)$ENTREZID
+
+cell_markers<-read.table("./Human_cell_markers_clusterProfiler.txt",sep="\t",header=T) #not exactly the same result as above vroom provided by Uncle Y.
+markers4.er<-enricher(gene=markers4_ENTREZID,TERM2GENE=cell_markers)
+
+barplot(markers4.er)
+geneInCategory(markers4.er)[3]
+markers4.symbol<-bitr(geneInCategory(markers4.er)[[3]],fromType="ENTREZID",toType = "SYMBOL",OrgDb=org.Hs.eg.db)
+binarymarkers4<-BinaryMarkerSelection(glioma.markers4[markers4.symbol$SYMBOL,],binary_cutoff = 0.8)
+FeaturePlot(glioma,rownames(binarymarkers4),reduction="tsne")
+```
+
+## Identify marker gene for cluster 8
+```{r Identify marker gene for cluster 8}
+glioma.markers8 <- FindMarkers(glioma,ident.1=8,only.pos = TRUE, min.pct = 0, logfc.threshold = 0.5, test.use = "wilcox")
+markers8 <- rownames(glioma.markers8 %>% filter(p_val_adj<0.01 & abs(avg_logFC)>1.5)) 
+#FeaturePlot(glioma,markers12,reduction="tsne")
+markers8_ENTREZID<-bitr(markers8,fromType = "SYMBOL",toType = "ENTREZID",OrgDb=org.Hs.eg.db)$ENTREZID
+
+cell_markers<-read.table("./Human_cell_markers_clusterProfiler.txt",sep="\t",header=T) #not exactly the same result as above vroom provided by Uncle Y.
+markers8.er<-enricher(gene=markers8_ENTREZID,TERM2GENE=cell_markers)
+
+barplot(markers8.er)
+geneInCategory(markers8.er)[3]
+markers8.symbol<-bitr(geneInCategory(markers8.er)[[3]],fromType="ENTREZID",toType = "SYMBOL",OrgDb=org.Hs.eg.db)
+binarymarkers8<-BinaryMarkerSelection(glioma.markers8[markers8.symbol$SYMBOL,],binary_cutoff = 0.8)
+FeaturePlot(glioma,rownames(binarymarkers8),reduction="tsne")
+```
+
+
+##  Add macrophages cell label
+```{r Add macrophages cell label}
+macrophages = read.table(file = "./markers/macrophages_marker.txt",header = FALSE)
+macrophages_list <-  list(as.vector(macrophages$V1))
+glioma <- AddModuleScore(
+  object = glioma,
+  features = macrophages_list,
+  nbin = 30,
+  ctrl = 100,
+  name = 'macrophages'
+)
+head(glioma@meta.data)
+```
+
+## Add T cell label
+```{r add T cell label}
+T_cells = read.table(file = "./T_cells_marker.txt",header = FALSE)
+T_cells_list <-  list(as.vector(T_cells$V1))
+glioma <- AddModuleScore(
+  object = glioma,
+  features = T_cells_list,
+  nbin = 30,
+  ctrl = 100,
+  name = 'T_cells'
+)
+
+```
+## Add oligodendrocytes cell label
+```{r Add oligodendrocytes cell label}
+oligodendrocytes = read.table(file = "./markers/oligodendrocytes_pipeline_selected_marker.txt",header = FALSE)
+oligodendrocytes_list <-  list(as.vector(oligodendrocytes$V1))
+#oligodendrocytes_list <- list(oligodendrocytes_list[[1]][-3])
+glioma <- AddModuleScore(
+  object = glioma,
+  features = oligodendrocytes_list,
+  nbin = 30,  
+  ctrl = 100,
+  name = 'oligodendrocytes'
+)
+```
+
+## Judge whehter a cell is maglinant or not based on addModuleScore of 3 cell types above
+```{r judge whehter a cell is maglinant or not based on addModuleScore of 3 cell types above}
+glioma@meta.data$macrophages_signal= (glioma@meta.data$macrophages1>1)
+glioma@meta.data$T_cells_signal= (glioma@meta.data$T_cells1>0.8)
+glioma@meta.data$oligodendrocytes_signal= (glioma@meta.data$oligodendrocytes1>0.8)
+glioma@meta.data$malignant_ByaddmoduleScore= (glioma@meta.data$macrophages_signal == FALSE & glioma@meta.data$T_cells_signal == FALSE & glioma@meta.data$oligodendrocytes_signal == FALSE)
+DimPlot(glioma, group.by = "malignant_ByaddmoduleScore", reduction = "tsne")
+DimPlot(glioma,reduction="tsne",group.by = "T_cells_signal")+FeaturePlot(glioma,as.character(T_cells$V1),reduction="tsne")
+DimPlot(glioma,reduction="tsne",group.by = "oligodendrocytes_signal")+FeaturePlot(glioma,as.character(oligodendrocytes$V1),reduction="tsne")
+DimPlot(glioma,reduction="tsne",group.by = "macrophages_signal")+FeaturePlot(glioma,as.character(macrophages$V1),reduction="tsne")
+```
+
+## Add OPC module signal by Suva
+```{r Add OPC module signal by Suva}
+OPC = read.table(file = "./markers/OPC_gene_Suva.txt",header = FALSE)
+OPC_list <-  list(as.vector(OPC$V1))
+glioma <- AddModuleScore(
+  object = glioma,
+  features = OPC_list,
+  nbin = 30,  
+  ctrl = 100,
+  name = 'OPC_module'
+)
+glioma@meta.data$OPC_module_signal= (glioma@meta.data$OPC_module1>0)
+```
+
+## Add AC module signal by Suva
+```{r Add OPC module signal by Suva}
+AC = read.table(file = "./markers/AC_gene_Suva.txt",header = FALSE)
+AC_list <-  list(as.vector(AC$V1))
+glioma <- AddModuleScore(
+  object = glioma,
+  features = AC_list,
+  nbin = 30,  
+  ctrl = 100,
+  name = 'AC_module'
+)
+glioma@meta.data$AC_module_signal= (glioma@meta.data$AC_module1>0)
+```
+
+## Add MES1 module signal by Suva
+```{r Add MES1 module signal by Suva}
+MES1 = read.table(file = "./markers/MES1_gene_Suva.txt",header = FALSE)
+MES1_list <-  list(as.vector(MES1$V1))
+glioma <- AddModuleScore(
+  object = glioma,
+  features = MES1_list,
+  nbin = 30,  
+  ctrl = 100,
+  name = 'MES1_module'
+)
+glioma@meta.data$MES1_module_signal= (glioma@meta.data$MES1_module1>0)
+```
+
+## Add MES2 module signal by Suva
+```{r Add MES2 module signal by Suva}
+MES2 = read.table(file = "./markers/MES2_gene_Suva.txt",header = FALSE)
+MES2_list <-  list(as.vector(MES2$V1))
+glioma <- AddModuleScore(
+  object = glioma,
+  features = MES2_list,
+  nbin = 30,  
+  ctrl = 100,
+  name = 'MES2_module'
+)
+glioma@meta.data$MES2_module_signal= (glioma@meta.data$MES2_module1>0)
+```
+
+## Add NPC1 module signal by Suva
+```{r Add NPC1 module signal by Suva}
+NPC1 = read.table(file = "./markers/NPC1_gene_Suva.txt",header = FALSE)
+NPC1_list <-  list(as.vector(NPC1$V1))
+glioma <- AddModuleScore(
+  object = glioma,
+  features = NPC1_list,
+  nbin = 30,  
+  ctrl = 100,
+  name = 'NPC1_module'
+)
+glioma@meta.data$NPC1_module_signal= (glioma@meta.data$NPC1_module1>0)
+```
+
+## Add NPC2 module signal by Suva
+```{r Add NPC2 module signal by Suva}
+NPC2 = read.table(file = "./markers/NPC2_gene_Suva.txt",header = FALSE)
+NPC2_list <-  list(as.vector(NPC2$V1))
+glioma <- AddModuleScore(
+  object = glioma,
+  features = NPC2_list,
+  nbin = 30,  
+  ctrl = 100,
+  name = 'NPC2_module'
+)
+glioma@meta.data$NPC2_module_signal= (glioma@meta.data$NPC2_module1>0)
+```
+
+
+
+## CNV calculation  based on the workflow from Suva's papers.
+```{r CNV calculation}
+
+
+#step1: obtaining genes fitting for CNV calculation
+
+position <-read.table("./suva_gene_pos.txt",stringsAsFactors = F,header=T) # gene database
+rownames(position)<-position$gene_name 
+cell<-colnames(glioma@assays$RNA@counts)
+Eij<-exp.mat[,cell]#only cells are used in Seurat.
+gene<-rownames(Eij) 
+Eij<-Eij[gene %in% rownames(position),] #only these fish genes from this datset are in database. #21898
+TPMij <-10*(2^Eij-1)#transform to TPM
+Ea_pre <- apply(TPMij,1,mean) #no row and col names
+Ea <- log2(Ea_pre+1)
+names(Ea) <- rownames(TPMij)
+Eij <-Eij[Ea>4,]   #8104 7930
+
+#step2: arrange genes
+gene<-rownames(Eij)
+position <- position[gene,] %>% arrange(chromosome,start) # position is used to record the location information for gene in the CNV calculation
+rownames(position)<-position$gene_name
+list_order <- position$gene_name  #arrange will dicard the rownames.
+Eij <- Eij[list_order,] #8104 7930  
+
+#step3 : scale the data
+Era <- apply(Eij,1,mean)  #no row and col names
+Erij <- apply(Eij,2,function(x){return(x-Era)}) 
+#t <- Eij-Era
+#identical(t,Erij) is true. Sometimes, it's  just too simple....
+
+#step4 : initial CNV calculation
+
+CNV_initial_Call<-function(x){
+  m<-NULL
+  chr<-unique(position$chromosome)
+  for(i in 1:length(chr)){
+    chunk<-x[position$chromosome==chr[i]]
+    len=length(chunk)
+    index<-1:len
+    A<-ifelse(index-50<=0,1,index-50)
+    B<-ifelse(index+50>=len,len,index+50) 
+    for(j in index){
+      s=mean(chunk[A[j]:B[j]])
+     # cat("chunk",i, "line",j,"index",A[j],"to",B[j], ":",s,"\n")
+      m<-append(m,s)
+    }  
+  }
+  return(m)
+}
+detectCores(logical=F) #phisical core
+cl<- makeCluster(20) 
+clusterExport(cl,"position")# object position should be exported to clusters
+#system.time(CNV_initial2 <- apply(Erij[,1:2],2,CNV_initial_Call))
+system.time(CNV_initial <- parApply(cl,Erij,2,CNV_initial_Call))
+stopCluster(cl)
+rownames(CNV_initial) <- rownames(Erij)
+
+
+
+#step5: Baseline CNV calculation
+CNV_base <- apply(CNV_initial[,!glioma$malignant_ByaddmoduleScore],1,mean)
+CNV_relative <- (CNV_initial - CNV_base)  # 8104 7930
+
+#step6: global CNV signal
+CNV_signal <- apply(CNV_relative^2, 2, mean)  # 7930
+
+#CNV_patient_back <-CNV_patient
+
+#step7: CNV_correlation
+mag<- glioma$malignant_ByaddmoduleScore
+tmp <- CNV_relative[,mag] #only the malignant cells #8104 6724 (gene cell)
+#table(glioma@meta.data$malignant_ByaddmoduleScore,colnames(CNV_relative) %>% str_extract("([A-Z]+\\d+)")) #check whether each patient has maglinat cells. If not, CNV_Correlation_Cal will report an error of subscript out of bounds in base::t(CNV_patient)[, patient].
+tmp<-as.data.frame(base::t(tmp)) # 6724 8104 # if use t, it may use function t from BiocGenerics and return the input, not the transpose.
+patient<-rownames(tmp) %>% str_extract("([A-Z]+\\d+)")
+col_name <- colnames(tmp)  # 8104 gene
+tmp$patient <- patient  # 6724
+CNV_patient <- tmp %>% group_by(patient)  %>% summarise_all(mean) # 28 8104 this line may cost 10 mins  
+
+CNV_patient <- as.data.frame(CNV_patient)
+row_name <- CNV_patient$patient #Setting row names on a tibble is deprecated.
+CNV_patient <- subset(CNV_patient,select=-patient)#names are discarded by subset
+rownames(CNV_patient)<-row_name
+colnames(CNV_patient)<-col_name
+
+index<-1
+CNV_Correlation_Cal <- function(x){
+  patient <- colnames(CNV_relative)[index] %>% str_extract("([A-Z]+\\d+)")  
+  index <<- index+1
+  #cat(patient,x[1:2],"\n")
+  rho<-cor(x,base::t(CNV_patient)[,patient])  # you can't give a row of a dataframe and a colomn of another dataframe into cor... otherwise, it will cause an error of incompatible dimension. 
+  return(rho)
+}
+system.time(CNV_Correlation<-apply(CNV_relative,2,CNV_Correlation_Cal))  
+
+```
+
+
+## read in CNV values provided by Xiongwei
+### CNV file format shoulde be corretet ,add one colname--cell and only CNV_original and CNV_cor is needed.  
+```{r read in CNV values provided by Xiongwei }
+
+glioma$CNV_signal<- CNV_signal
+glioma$CNV_corr<- CNV_Correlation
+glioma@meta.data$CNV <- (glioma@meta.data$CNV_signal>0.02  & glioma@meta.data$CNV_corr >0.4)
+
+```
+
+## Judge whether a cell is maglinant or not based on UMAP, CNV + addmoduleScore of 3 cell types
+### cluster 3, 11, 14 are regarded as non-maglinant cells according to umap clusters when dimension is set as 15
+```{r judge whether a cell is maglinant or not based on UMAP, CNV + addmoduleScore of 3 cell types}
+glioma@meta.data$malignant_signal <- ((!glioma@meta.data$umap_clusters %in% c(3,11,14)) & glioma@meta.data$malignant_ByaddmoduleScore & glioma@meta.data$CNV)
+DimPlot(glioma, group.by = "malignant_signal", reduction = "tsne")+DimPlot(glioma, group.by = "patient_ID", reduction = "tsne")
+DimPlot(glioma, group.by = "umap_clusters", reduction = "tsne",label = TRUE)+DimPlot(glioma, group.by = "malignant_signal", reduction = "tsne")
+```
+##Clustering malignant cells and visualization
+```{r}
+glioma_malignant <- subset(glioma, subset = malignant_signal == TRUE)
+eglioma_malignant <- CreateSeuratObject(counts = exp.mat_malignant , project = "GSE131928_malignant")
+glioma_malignant$patient_ID <-colnames(exp.mat_malignant) %>% str_extract("^[A-Z]+\\d+")
+glioma_malignant <- subset(glioma_malignant, subset = nFeature_RNA > 3000)
+glioma_malignant <- FindVariableFeatures(glioma_malignant, selection.method = "vst", nfeatures = 2000)
+glioma_malignant <- ScaleData(glioma_malignant)
+all.genes <- rownames(glioma_malignant)
+glioma_malignant <- RunPCA(glioma_malignant, features = VariableFeatures(object = glioma_malignant))
+ElbowPlot(glioma_malignant,ndims = 50)
+glioma_malignant <- FindNeighbors(glioma_malignant, dims = 1:30)   # 15
+glioma_malignant <- FindClusters(glioma_malignant, resolution = 0.3)
+glioma_malignant <- RunUMAP(glioma_malignant, dims = 1:30)
+glioma_malignant <- RunTSNE(glioma_malignant,dims = 1:30,features = VariableFeatures(object = glioma_malignant))
+#DimPlot(glioma_malignant, group.by = "patient_ID", reduction = "tsne")
+glioma_malignant@meta.data$umap_clusters <-glioma_malignant@active.ident
+
+DimPlot(glioma_malignant, reduction = "tsne",group_by="umap_clusters",label=TRUE)+DimPlot(glioma_malignant, reduction = "tsne",group.by="patient_ID")
+table(glioma_malignant$patient_ID,glioma_malignant$umap_clusters)
+write.csv(table(glioma_malignant$patient_ID,glioma_malignant$umap_clusters),file = 'GSE131928/file/malignant_cluster.csv')
+```
+
+## Add neuron-glioam-synapse label
+```{r add ngs label}
+
+ngs_features = read.table(file = "./markers/synaptic_gene_2020.7.15.txt",header = FALSE)
+feature_list <-  list(as.vector(ngs_features$V1))
+glioma <- AddModuleScore(
+  object = glioma,
+  features = feature_list,
+  nbin = 30,
+  ctrl = 100,
+  name = 'ngs_features'
+)
+glioma@meta.data$NGS_signal= (glioma@meta.data$ngs_features1>0)
+DimPlot(glioma, group.by = "NGS_signal", reduction = "tsne") 
+```
+
+## Identify magliant cells which can form synapse with neurons.
+```{r identify magliant cells which can form synapse with neurons}
+l<-length(glioma$NGS_signal)
+glioma$final_label <- vector(length=l,mode="numeric")
+for( i in 1:l){
+  if(glioma$NGS_signal[i] == "FALSE" & glioma$malignant_signal[i]== "TRUE")  glioma$final_label[i]=1 
+  if(glioma$NGS_signal[i] == "TRUE"  & glioma$malignant_signal[i]== "TRUE")   glioma$final_label[i]=2 
+  if(glioma$NGS_signal[i] == "FALSE" & glioma$malignant_signal[i]== "FALSE") glioma$final_label[i]=3 
+  if(glioma$NGS_signal[i] == "TRUE"  & glioma$malignant_signal[i]== "FALSE")  glioma$final_label[i]=4 
+}
+glioma$final_cluster <- as.numeric(glioma$final_label)
+DimPlot(glioma,group.by="final_label",reduction="tsne")
+```
+
+## Identify magliant cells which can form synapse with neurons in each cluster
+```{r identify magliant cells which can form synapse with neurons in each cluster}
+glioma$new_final_label <- vector(length=l,mode="numeric")
+for( i in 1:l){
+  #if  glioma$new_final_cluster is 1 , 2, 3, 4, it means these cells belongs to cluster 0 produced by PCA
+  j<-as.numeric(as.character(glioma$umap_clusters))[i]
+  if(glioma$final_label[i]==1)  glioma$new_final_label[i]=j*10+1 #the rightmost digit 1 indicate non-ngs of malignant,  digits indict cluster 
+  if(glioma$final_label[i]==2)  glioma$new_final_label[i]=j*10+2 #the rightmost digit 2 indicate ngs of  malignant,  digits indict cluster
+  if(glioma$final_label[i]==3)  glioma$new_final_label[i]=j*10+3 #the rightmost digit 3 indicate non-ngs of non-malignant, digits indict cluster
+  if(glioma$final_label[i]==4)  glioma$new_final_label[i]=j*10+4 #the rightmost digit 4 indicate ngs of non-malignant, digits indict cluster
+}
+glioma$new_final_cluster <- as.numeric(glioma$new_final_label)
+```
+
+## Save Rdata
+```{r}
+save(glioma, file = "GSM3828672.RData")
+save.image(file = "GSE131928_workspace.RData") #2021-10-24
+```
+
+## Identify differentially expressed  genes between different clusters
+```{r identify differentially expressed  genes between different clusters}
+names(glioma$final_label) <- names(glioma@active.ident)
+glioma@active.ident <- as.factor(glioma$final_label)
+deg<-list()
+#names(glioma$final_cluster) <- names(glioma@active.ident)
+#glioma@active.ident <- as.factor(glioma$final_cluster)
+DimPlot(glioma,reduction = "tsne")
+deg$c1vs2 <- FindMarkers(glioma,ident.1=2,ident.2=1 ,only.pos = FALSE, min.pct = 0, logfc.threshold = 0.5, test.use = "wilcox") # new means using new_final_cluster
+
+deg$c1vs2_Corrected <- FindMarkers(glioma,ident.1=2,ident.2=1 ,only.pos = FALSE, min.pct = 0, logfc.threshold = 0.5, test.use = "wilcox",mean.fxn=rowMeans) # new means using new_final_cluster
+#glioma.markers<-deg$c1vs2 %>% filter(p_val_adj < 0.01)
+
+if(corrected == "Yes"){
+  glioma.markers<-deg$c1vs2_Corrected %>% filter(p_val_adj < 0.01)
+}else{
+  glioma.markers<-deg$c1vs2 %>% filter(p_val_adj < 0.01)
+}
+all_DEG<-rownames(glioma.markers)
+lnc<-rownames(biotype[all_DEG,] %>% filter(gene_type=="lincRNA"))
+non_lnc<-rownames(biotype[all_DEG,] %>% filter(gene_type=="non_lincRNA")) 
+length(all_DEG)-length(lnc)-length(non_lnc) #missed 12 genes in biotype dataframe
+partA<-glioma.markers[lnc,] %>% arrange(by=p_val_adj,by=avg_logFC)
+partB<-glioma.markers[non_lnc,] %>% arrange(by=p_val_adj,by=avg_logFC)
+missed<-all_DEG[!all_DEG %in% c(lnc,non_lnc)]
+partC<-glioma.markers[missed,] %>% arrange(by=p_val_adj,by=avg_logFC)
+partA<-rbind(partA,partB)
+partA<-rbind(partA,partC)
+write.table(partA,file="DEG.txt",sep="\t",col.names=T,row.names=TRUE,quote=FALSE)
+
+
+
+
+
+```
+
+## Enrichment Aanalysis
+```{r Enrichment Aanalysis}
+human<- rownames(glioma.markers %>% filter(p_val_adj<0.05 & abs(avg_logFC)>0.5))
+#FeaturePlot(glioma,human,reduction="tsne")
+human_ENTREZID<-bitr(human,fromType = "SYMBOL",toType = "ENTREZID",OrgDb=org.Hs.eg.db)$ENTREZID
+gene.GO<-enrichGO(gene=human_ENTREZID,OrgDb = org.Hs.eg.db,keyType="ENTREZID",ont="ALL",pAdjustMethod = "BH",pvalueCutoff = 0.05, qvalueCutoff = 0.05,readable=T)
+GSE131928_enrichment <- barplot(gene.GO)
+geneInCategory(gene.GO)#get genes in GOs
+```
+
+# Signature 
+```{r Signature}
+
+
+signature<-list(c(as.character(ngs_feature),"MGC2889","LOC150622","LINC00673","LINC00599"))
+glioma <- AddModuleScore (
+  object = glioma,
+  features = signature,
+  nbin = 30,
+  ctrl = 100,
+  name = 'signature'
+)
+glioma$signature1_signal<-glioma$signature1>0
+table(glioma$signature1_signal,glioma$NGS_signal)
+DimPlot(glioma, dims=c(1,2),pt.size=0.2,group.by = "malignant_signal", reduction = "tsne")+DimPlot(glioma, dims=c(1,2),pt.size=0.2,group.by = "NGS_signal", reduction = "tsne")+DimPlot(glioma, dims=c(1,2),pt.size=0.2,group.by = "signature1_signal", reduction = "tsne")
+
+##to verify new signature is better than the old one
+for(i in 1:10){
+  set.seed(i)
+  small<-lnc[sample(length(lnc),4)]
+  signature<-list(c(as.character(ngs_feature),small))
+  cat(small,"\n")
+  Best<-list(c(as.character(ngs_feature),"MGC2889","LOC150622","LINC00673","LINC00599"))
+  if(identical(Best,signature)){cat("Running into Best\n");next}
+  glioma <- AddModuleScore (
+  object = glioma,
+  features = signature,
+  nbin = 30,
+  ctrl = 100,
+  name = 'signature'
+)
+  glioma$signature1_signal<-glioma$signature1>0
+  cat(table(glioma$signature1_signal,glioma$NGS_signal),"\n")
+}
+
+
+```
+
+
+## Statistics and Plot
+```{r Statistics and Plot}
+#heterogeneity#
+#par(mfrow=c(1,4))
+sink()
+#pdf("figure2-GSE131928-1.pdf")
+a<-DimPlot(glioma, dims=c(1,2),pt.size=0.2,group.by = "patient_ID",reduction = "tsne")
+#sink()
+#pdf("figure2-GSE131928-2.pdf")
+b<-DimPlot(glioma, dims=c(1,2),pt.size=0.2,group.by = "umap_clusters", reduction = "tsne")
+#sink()
+#pdf("figure2-GSE131928-3.pdf")
+c<-DimPlot(glioma, dims=c(1,2),pt.size=0.2,group.by = "malignant_signal",reduction = "tsne")
+#sink()
+#pdf("figure2-GSE131928-4.pdf")
+d<-DimPlot(glioma, dims=c(1,2),pt.size=0.2,group.by = "NGS_signal", reduction = "tsne")
+#sink()
+pdf("figure2-GSE131928.pdf",height=7,width=40) # default is 7*7inch
+cowplot::plot_grid(DimPlot(glioma, group.by = "patient_ID", reduction = "tsne"),DimPlot(glioma, group.by = "umap_clusters", reduction = "tsne"),DimPlot(glioma, group.by = "malignant_signal", reduction = "tsne"),DimPlot(glioma, group.by = "NGS_signal", reduction = "tsne"),labels=c("A","","",""),ncol=4)
+heterogenity<-table(glioma$patient_ID, glioma$umap_clusters)
+write.table(heterogenity,file="heterogenity.txt",quote=FALSE,sep="\t",row.names = TRUE,col.names = TRUE)
+
+
+#GAP43 expression pattern#
+DimPlot(glioma, group.by = "malignant_signal", reduction = "tsne")+FeaturePlot(glioma,"GAP43",reduction="tsne")+DimPlot(glioma, group.by = "NGS_signal", reduction = "tsne")
+#names(glioma$malignant_signal) <- names(glioma@active.ident)
+glioma@active.ident <- as.factor(as.numeric((glioma$malignant_signal)))
+names(glioma@active.ident)<-colnames(glioma)
+ForGAP43Only<-FindMarkers(glioma,ident.1=1, ident.2=0,only.pos = FALSE, min.pct = 0, logfc.threshold = 0.5, test.use = "wilcox")
+
+#ngs expression pattern#
+ngs_synapse = read.table(file = "./markers/synaptic_gene_2020.7.15.txt",header = FALSE)
+ngs_feature = ngs_synapse$V1
+exp_ngs = glioma@assays$RNA@data[ngs_feature,]
+feature_malignant = glioma@meta.data[,'malignant_signal']
+annotation_col <- data.frame(cell = feature_malignant)
+annotation_col$cell[annotation_col$cell == F] <- 'Normal'
+annotation_col$cell[annotation_col$cell == T] <- 'Malignant'
+rownames(annotation_col)<-rownames(glioma@meta.data)
+annotation_col$cell <- as.character(annotation_col$cell)
+exp_ngs <- exp_ngs[,order(annotation_col$cell)]
+
+#exp_ngs_bayes_correlation<-BaCo(exp_ngs)
+pheatmap(filename="ngs_pheatmap.pdf", treeheight_row=0,exp_ngs,annotation_col = annotation_col,fontsize_row = 10,clustering_distance_rows="manhattan",cluster_rows = TRUE,cluster_cols = FALSE,show_colnames = FALSE,color = colorRampPalette(c("navy", "white", "firebrick3"))(50))
+
+
+
+annotation_col <- data.frame(final_cluster = glioma@meta.data[,'final_cluster'])
+rownames(annotation_col)<-rownames(glioma@meta.data)
+annotation_col$final_cluster <- as.character(annotation_col$final_cluster)
+#exp_lnc <-  glioma@assays$RNA@data[lnc,order(annotation_col$final_cluster)]
+#star<-c("LINC00599", "MIAT", "LINC00643","MEG3","LOC441204","FGF14-IT1","TTTY15","FLJ46906")
+star<-unique(first_lnc_ngs$LncRNA)
+exp_lnc <-  glioma@assays$RNA@data[star,order(annotation_col$final_cluster)]
+pheatmap(exp_lnc,annotation_col = annotation_col,fontsize_row = 5,cluster_rows = FALSE,cluster_cols = FALSE,show_colnames = FALSE,color = colorRampPalette(c("navy", "white", "firebrick3"))(50))
+
+## lncRNA coexpress with ngs
+a<-unlist(str_split(coexpress_lncRNA_ngs,pattern="%"))
+l<-c();p<-c();m<-c()
+for(i in seq(1,length(a),by=3)){
+  l<-append(l,a[i])
+  p<-append(p,a[i+1])
+  m<-append(m,a[i+2])
+}
+file_coexpresss_lncRNA_ngs<-data.frame(lncRNA=l,protein=p,module=m)
+write.table(file_coexpresss_lncRNA_ngs,file="coexpresss_lncRNA_ngs.txt",quote=FALSE,sep="\t",row.names = FALSE)
+
+##
+write.table(Integrative_Result,file="Integrative_Result.txt",quote=FALSE,sep="\t",row.names = FALSE)
+
+##expression ratio of ngs in malignant cells
+Ratio_calculation<-function(x){sum(x>0)/length(x)}
+target_cell_expression<-glioma@assays$RNA@counts[,glioma$malignant_signal==TRUE]
+a<-apply(target_cell_expression,1,Ratio_calculation)
+write.table(a[as.character(ngs_features$V1)],file="NGS_expression_ratio.txt",quote=FALSE,sep="\t",row.names = TRUE,col.names = FALSE)
+
+##expression ratio of lncRNA in malignant ngs-positive cells
+lncRNA <-c("LOC100216479","LOC150568","LINC00839","LINC00260","LOC283683","BCYRN1","FLJ10038","MEG3","LINC00599","LOC100190986","PAR-SN","H3F3AP4","PRH1-PRR4","TTTY15","KCNIP4-IT1","MIAT","LOC646278")
+
+target_cell_expression2<-glioma@assays$RNA@counts[lncRNA,glioma$malignant_signal & glioma$NGS_signal]
+a<-apply(target_cell_expression2,1,Ratio_calculation)
+write.table(a,file="lnc_expression_ratio.txt",quote=FALSE,sep="\t",row.names = TRUE,col.names = FALSE)
+
+all_lncRNA<-rownames(biotype[rownames(glioma),] %>% filter(gene_type=="lincRNA"))
+target_cell_expression3<-glioma@assays$RNA@counts[all_lncRNA,glioma$malignant_signal & glioma$NGS_signal]
+a<-apply(target_cell_expression3,1,Ratio_calculation)
+write.table(a,file="all_lnc_expression_ratio.txt",quote=FALSE,sep="\t",row.names = TRUE,col.names = FALSE)
+
+##expression ratio of lncRNA in malignant ngs-negative cells
+lncRNA <-c("LOC100216479","LOC150568","LINC00839","LINC00260","LOC283683","BCYRN1","FLJ10038","MEG3","LINC00599","LOC100190986","PAR-SN","H3F3AP4","PRH1-PRR4","TTTY15","KCNIP4-IT1","MIAT","LOC646278")
+
+target_cell_expression2<-glioma@assays$RNA@counts[lncRNA,glioma$malignant_signal & glioma$NGS_signal]
+a<-apply(target_cell_expression2,1,Ratio_calculation)
+write.table(a,file="lnc_expression_ratio.txt",quote=FALSE,sep="\t",row.names = TRUE,col.names = FALSE)
+
+all_lncRNA<-rownames(biotype[rownames(glioma),] %>% filter(gene_type=="lincRNA"))
+target_cell_expression3<-glioma@assays$RNA@counts[all_lncRNA,glioma$malignant_signal & glioma$NGS_signal]
+a<-apply(target_cell_expression3,1,Ratio_calculation)
+write.table(a,file="all_lnc_expression_ratio.txt",quote=FALSE,sep="\t",row.names = TRUE,col.names = FALSE)
+
+
+
+#load("GBM.Rdata")
+source("/home1/GSE131928/TCGA_gsva.R")
+#MAP2-ENSG00000078018; PTPRS-ENSG00000105426 , ARHGEF2-ENSG00000116584, LRRTM2-ENSG00000146006 
+#LINC00599 and LOC100190986 
+tmp<-c("ENSG00000078018","ENSG00000116584","ENSG00000146006")
+GBM_surv1<-gsva_surv("GBM",tmp)
+ngs_features_ID<-bitr(ngs_features$V1,fromType = "SYMBOL",toType = "ENSEMBL",OrgDb=org.Hs.eg.db)$ENSEMBL
+n<-ngs_features_ID[c(-17,-18)]
+GBM_surv1<-gsva_surv("GBM",n[i:(i+1)])
+
+source("/home1/GSE131928/survival.R")
+TCGA_surv("GBM",tmp)
+
+
+##
+GSE131928_DEG_lnc<-read.table(file="GSE131928_DEG_lnc.txt",head=FALSE,sep="\t",stringsAsFactors = FALSE)
+GSE131928_pediatric_DEG_lnc<-read.table(file="GSE131928_pediatric_DEG_lnc.txt",head=FALSE,sep="\t",stringsAsFactors = FALSE)
+GSE102130_DEG_lnc<-read.table(file="GSE102130_DEG_lnc.txt",head=FALSE,sep="\t",stringsAsFactors = FALSE)
+GSE119926_DEG_lnc<-read.table(file="GSE119926_DEG_lnc.txt",head=FALSE,sep="\t",stringsAsFactors = FALSE)
+GSE119926_PDX_DEG_lnc<-read.table(file="GSE119926_PDX_DEG_lnc.txt",head=FALSE,sep="\t",stringsAsFactors = FALSE)
+GSE89567_DEG_lnc<-read.table(file="GSE89567_DEG_lnc.txt",head=FALSE,sep="\t",stringsAsFactors = FALSE)
+GSE70630_DEG_lnc<-read.table(file="GSE70630_DEG_lnc.txt",head=FALSE,sep="\t",stringsAsFactors = FALSE)
+AA<-ngs_features$V1[ngs_features$V1 %in% GSE131928_DEG_lnc$V1]
+BB<-ngs_features$V1[ngs_features$V1 %in% GSE131928_pediatric_DEG_lnc$V1]
+CC<-ngs_features$V1[ngs_features$V1 %in% GSE102130_DEG_lnc$V1]
+DD<-ngs_features$V1[ngs_features$V1 %in% GSE119926_DEG_lnc$V1]
+#DD_PDX<-GSE119926_PDX_DEG_lnc$V1
+EE<-ngs_features$V1[ngs_features$V1 %in% GSE89567_DEG_lnc$V1]
+FF<-ngs_features$V1[ngs_features$V1 %in% GSE70630_DEG_lnc$V1]
+table(sort(c(AA,BB,CC,DD,DD_PDX,EE,FF)))
+table(sort(c(AA,CC,DD,EE,FF)))
+table(sort(c(AA,CC,DD)))
+
+(setdiff(AA,union(union(union(union(BB,CC),DD),EE),FF)))
+setdiff(FF,c(AA,CC,DD,EE))
+intersect(intersect(intersect(intersect(intersect(AA,BB),CC),DD),EE),FF)
+
+
+
+GSE131928_DEG_pro<-read.table(file="GSE131928_DEG_pro.txt",head=FALSE,sep="\t",stringsAsFactors = FALSE)
+#SE131928_pediatric_DEG_lnc<-read.table(file="GSE131928_pediatric_DEG_lnc.txt",head=FALSE,sep="\t",stringsAsFactors = FALSE)
+GSE102130_DEG_pro<-read.table(file="GSE102130_DEG_pro.txt",head=FALSE,sep="\t",stringsAsFactors = FALSE)
+GSE119926_DEG_pro<-read.table(file="GSE119926_DEG_pro.txt",head=FALSE,sep="\t",stringsAsFactors = FALSE)
+#GSE119926_PDX_DEG_lnc<-read.table(file="GSE119926_PDX_DEG_lnc.txt",head=FALSE,sep="\t",stringsAsFactors = FALSE)
+GSE89567_DEG_pro<-read.table(file="GSE89567_DEG_pro.txt",head=FALSE,sep="\t",stringsAsFactors = FALSE)
+GSE70630_DEG_pro<-read.table(file="GSE70630_DEG_pro.txt",head=FALSE,sep="\t",stringsAsFactors = FALSE)
+AA<-as.character(ngs_features$V1[ngs_features$V1 %in% GSE131928_DEG_pro$V1])
+#BB<-ngs_features$V1[ngs_features$V1 %in% GSE131928_pediatric_DEG_pro$V1]
+CC<-as.character(ngs_features$V1[ngs_features$V1 %in% GSE102130_DEG_pro$V1])
+DD<-as.character(ngs_features$V1[ngs_features$V1 %in% GSE119926_DEG_pro$V1])
+#DD_PDX<-GSE119926_PDX_DEG_lnc$V1
+EE<-as.character(ngs_features$V1[ngs_features$V1 %in% GSE89567_DEG_pro$V1])
+FF<-as.character(ngs_features$V1[ngs_features$V1 %in% GSE70630_DEG_pro$V1])
+table(sort(c(AA,CC,DD,EE,FF)))
+table(sort(c(AA,CC,DD,EE,FF)))
+table(sort(c(AA,CC,DD)))
+
+
+setdiff(AA,c(CC,DD,EE,FF))
+setdiff(FF,c(AA,CC,DD,EE))
+intersect(intersect(intersect(intersect(intersect(AA,BB),CC),DD),EE),FF)
+
+f<-function(x){sum(x>0)/length(x)}
+(apply(exp_ngs[,glioma$patient_ID=="MGH104"&glioma$umap_clusters==0],1,f))
+(apply(exp_ngs[,glioma$patient_ID=="MGH104"&glioma$umap_clusters==0&glioma$NGS_signal==TRUE],1,f))
+```
+
+
+
+
+
+##CNV pheatmap
+```{r CNV pheatmap}
+#arrange chr,CNV_matrix
+chr <- position["chromosome"]
+chrOrder <- c(paste("chr",1:22,sep = ""),"chrX","chrY","chr1_jh636052_fix","chr1_jh636053_fix")
+chr$gene_name <- rownames(chr)
+chr$chromosome<-factor(chr$chromosome,levels=chrOrder)
+chr <- chr[order(chr$chromosome),]
+chr <- chr['chromosome']
+CNV_relative_arranged <- CNV_relative[rownames(chr),]
+
+#test_relative <- CNV_relative[1:50,1:20]
+#test_relative_t <- t(test_relative)
+
+#use pheatmap
+CNV_relative_t <- t(CNV_relative_arranged)
+quantile_CNV <- quantile(CNV_relative_t,seq(0,1,0.05))
+bk1 <- seq(quantile_CNV[[2]],-0.01,by=0.01)
+bk2 <- seq(0,quantile_CNV[[20]],by=0.01)
+bk <- c(bk1,bk2)#define color range
+pheatmap(CNV_relative_t,annotation_col = chr,fontsize = 5,cluster_cols = FALSE,show_colnames = FALSE,show_rownames = FALSE,color = c(colorRampPalette(c("navy", "white"))(length(bk1)),colorRampPalette(c("white", "firebrick3"))(length(bk2))),breaks = bk)
+```
+
+##find CNV region
+```{r find CNV region V3}
+WGCNA_lnc <- c('LINC00673','H3F3AP4','LOC100216479','LOC150568','MIAT','LINC00839')
+malignant_cell <- rownames(glioma@meta.data[glioma@meta.data$final_label==1|glioma@meta.data$final_label==2,])
+normal_cell <- rownames(glioma@meta.data[glioma@meta.data$final_label==3,])
+malignant_CNV <- CNV_relative[,malignant_cell]
+normal_CNV <- CNV_relative[,normal_cell]
+malignant_CNV_mean <- apply(malignant_CNV, 1, mean)
+normal_CNV_mean <- apply(normal_CNV, 1, mean)
+differential_CNV_square <- (malignant_CNV_mean - normal_CNV_mean)**2
+quantile_CNV <- quantile(differential_CNV_square,seq(0,1,0.1))
+top_cutoff <- quantile_CNV[[length(quantile_CNV)-2]]#80%
+l_gene <- length(differential_CNV_square)
+gene_name <- rownames(CNV_relative)
+malignant_normal_diff_CNV_gene <- c()
+for (i in 1:l_gene){
+  if (differential_CNV_square[[i]]>top_cutoff){malignant_normal_diff_CNV_gene <- append(malignant_normal_diff_CNV_gene,gene_name[i])}
+}
+
+##malignant ngs vs malignant non-ngs
+NGS_malignant_cell <- rownames(glioma@meta.data[glioma@meta.data$final_label==2,])#get mglignat ngs cell name
+NonNGS_malignant_cell <- rownames(glioma@meta.data[glioma@meta.data$final_label==1,])#get malianant non-ngs
+NGS_malignant_CNV <- CNV_relative[malignant_normal_diff_CNV_gene,NGS_malignant_cell]#get malignant ngs CNV matrix
+NonNGS_malignant_CNV <- CNV_relative[malignant_normal_diff_CNV_gene,NonNGS_malignant_cell] #get malignant non-ngs CNV matrix
+ngs_CNV_mean <- apply(NGS_malignant_CNV, 1, mean)
+non_ngs_CNV_mean <- apply(NonNGS_malignant_CNV, 1, mean)
+differential_CNV_square <- (ngs_CNV_mean - non_ngs_CNV_mean)**2
+quantile_CNV <- quantile(differential_CNV_square,seq(0,1,0.1))
+top_cutoff <- quantile_CNV[[length(quantile_CNV)-2]]
+l_gene <- length(differential_CNV_square)
+gene_name <- rownames(CNV_relative)
+top_CNV_gene <- c()
+for (i in 1:l_gene){
+  if (differential_CNV_square[[i]]>top_cutoff){top_CNV_gene <- append(top_CNV_gene,gene_name[i])}
+}
+
+intersect(malignant_normal_diff_CNV_gene,WGCNA_lnc)
+intersect(top_CNV_gene,ngs_features)
+intersect(top_CNV_gene,WGCNA_lnc)
+```
+
+
+```{r}
+xw<-read.csv(file="667edgeR.csv",header=T)
+
+xw.GO<-enrichGO(gene=as.character(xw$Entrezgene),OrgDb = org.Hs.eg.db,keyType="ENTREZID",ont="ALL",pAdjustMethod = "BH",pvalueCutoff = 0.05, qvalueCutoff = 0.05,readable=T)
+barplot(gene.GO)
+```
+
+
+##get cellPhoneDB input file
+```{r run all data}
+#get count file
+count_cellPhoneDB <- as.matrix(glioma@assays$RNA@data)
+write.table(count_cellPhoneDB,'/cellPhoneDB/cellPhoneDB_count.txt',sep='\t',quote=F)
+#get metadata file
+glioma$cell_type = NA
+glioma$cell_type[!glioma$malignant_signal] <- 'normal'
+glioma$cell_type[glioma$final_label==1] <- 'nonNGS'
+glioma$cell_type[glioma$final_label==2] <- 'NGS'
+meta_data_cellPhoneDB <- cbind(rownames(glioma@meta.data),glioma@meta.data[,'cell_type',drop=F])
+meta_data_cellPhoneDB <- as.matrix(meta_data_cellPhoneDB)
+meta_data_cellPhoneDB[is.na(meta_data_cellPhoneDB)] = 'Unkown'#细胞类型中不能有NA
+write.table(meta_data_cellPhoneDB,'./cellPhoneDB/cellPhoneDB_metadata.txt',sep = '\t',quote = F,row.names = F)
+```
+
+##Count entropy
+```{r}
+#tag<-!(glioma$umap_clusters %in% c(3,11,14))
+#patient_cluster <- as.data.frame.matrix(table(glioma$patient_ID[tag],as.character(glioma$umap_clusters[tag])))
+
+tag<(glioma$malignant_signal == TRUE)
+patient_cluster <- as.data.frame.matrix(table(glioma$patient_ID[tag],as.character(glioma$umap_clusters[tag])))
+patient_cluster$col_entropy <- apply(patient_cluster,1,entropy.empirical)
+patient_cluster[nrow(patient_cluster)+1,-ncol(patient_cluster)] <- apply(patient_cluster[,-ncol(patient_cluster)],2,entropy.empirical)
+rownames(patient_cluster)[nrow(patient_cluster)] <- 'row_entropy'
+write.table(patient_cluster,file = './GSE131928/entropy.txt')
+```
+
+##entropy boxplot
+```{r}
+entropy_GSE131928 <-read.table('./GSE131928/entropy.txt')
+entropy_pediatric  <-read.table('./GSE131928_pediatric/entropy.txt')
+entropy_GSE89567<- read.table('./GSE89567/entropy.txt')
+entropy_GSE70630 <- read.table('./GSE70630/entropy.txt')
+entropy_GSE119926 <- read.table('./GSE119926/entropy.txt')
+entropy_GSE102130 <- read.table('./GSE102130/entropy.txt')
+entropy_GSE119926_PDX <- read.table('./GSE119926_2/entropy.txt')
+par(mar=c(10,4,4,0))
+boxplot(entropy_GSE131928$col_entropy,entropy_pediatric$col_entropy,entropy_GSE102130$col_entropy,entropy_GSE119926$col_entropy,entropy_GSE119926_PDX$col_entropy,entropy_GSE89567$col_entropy,entropy_GSE70630$col_entropy,names=c('GSE131928','GSE131928_pediatric','GSE102130','GSE119926','GSE119926_PDX','GSE89567','GSE70630'),main='Inter-tumor heterogenety',las=2) # col_entropy, the 
