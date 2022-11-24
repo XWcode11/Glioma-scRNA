@@ -1,8 +1,4 @@
----
----
-## only adult samples, 21 samples in all.
-## This CNV calculation version is for cell name containing sample names.
-## The expression matrix provided by these author is Eij actually. using Eij as the the input for seurat is better than using TPM.
+
 
 # Seurat workflow for GSE131928_GSM382867 (SmartSeq) 
 
