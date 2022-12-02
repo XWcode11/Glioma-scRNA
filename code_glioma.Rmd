@@ -37,7 +37,7 @@ glioma <- CreateSeuratObject(counts = exp.mat , project = "GSM3828672") #remove 
 patient = read.table(file = "./patient_ID_col",header = FALSE)
 rownames(patient) <- patient$V1
 glioma$patient_ID <- patient$V2
-glioma<-subset(glioma,subset=(patient_ID %in% c("MGH100","MGH101","MGH102","MGH104","MGH105","MGH106","MGH110","MGH113", "MGH115","MGH121","MGH122","MGH124","MGH125","MGH128","MGH129","MGH136","MGH143","MGH151","MGH152","MGH66","MGH85")))
+glioma<-subset(glioma,subset=(patient_ID %in% c("MGH100","MGH101","MGH102","MGH104","MGH105","MGH106","MGH110","MGH113", "MGH115","MGH121","MGH122","MGH124","MGH125","MGH128","MGH129","MGH136","MGH143","MGH151","MGH152","MGH66")))
 glioma$patient_ID<-as.factor(as.character(glioma$patient_ID))
 glioma$new_patient_ID <- 'NA'
 j=1
@@ -924,45 +924,3 @@ xw<-read.csv(file="667edgeR.csv",header=T)
 xw.GO<-enrichGO(gene=as.character(xw$Entrezgene),OrgDb = org.Hs.eg.db,keyType="ENTREZID",ont="ALL",pAdjustMethod = "BH",pvalueCutoff = 0.05, qvalueCutoff = 0.05,readable=T)
 barplot(gene.GO)
 ```
-
-
-##get cellPhoneDB input file
-```{r run all data}
-#get count file
-count_cellPhoneDB <- as.matrix(glioma@assays$RNA@data)
-write.table(count_cellPhoneDB,'/cellPhoneDB/cellPhoneDB_count.txt',sep='\t',quote=F)
-#get metadata file
-glioma$cell_type = NA
-glioma$cell_type[!glioma$malignant_signal] <- 'normal'
-glioma$cell_type[glioma$final_label==1] <- 'nonNGS'
-glioma$cell_type[glioma$final_label==2] <- 'NGS'
-meta_data_cellPhoneDB <- cbind(rownames(glioma@meta.data),glioma@meta.data[,'cell_type',drop=F])
-meta_data_cellPhoneDB <- as.matrix(meta_data_cellPhoneDB)
-meta_data_cellPhoneDB[is.na(meta_data_cellPhoneDB)] = 'Unkown'#细胞类型中不能有NA
-write.table(meta_data_cellPhoneDB,'./cellPhoneDB/cellPhoneDB_metadata.txt',sep = '\t',quote = F,row.names = F)
-```
-
-##Count entropy
-```{r}
-#tag<-!(glioma$umap_clusters %in% c(3,11,14))
-#patient_cluster <- as.data.frame.matrix(table(glioma$patient_ID[tag],as.character(glioma$umap_clusters[tag])))
-
-tag<(glioma$malignant_signal == TRUE)
-patient_cluster <- as.data.frame.matrix(table(glioma$patient_ID[tag],as.character(glioma$umap_clusters[tag])))
-patient_cluster$col_entropy <- apply(patient_cluster,1,entropy.empirical)
-patient_cluster[nrow(patient_cluster)+1,-ncol(patient_cluster)] <- apply(patient_cluster[,-ncol(patient_cluster)],2,entropy.empirical)
-rownames(patient_cluster)[nrow(patient_cluster)] <- 'row_entropy'
-write.table(patient_cluster,file = './GSE131928/entropy.txt')
-```
-
-##entropy boxplot
-```{r}
-entropy_GSE131928 <-read.table('./GSE131928/entropy.txt')
-entropy_pediatric  <-read.table('./GSE131928_pediatric/entropy.txt')
-entropy_GSE89567<- read.table('./GSE89567/entropy.txt')
-entropy_GSE70630 <- read.table('./GSE70630/entropy.txt')
-entropy_GSE119926 <- read.table('./GSE119926/entropy.txt')
-entropy_GSE102130 <- read.table('./GSE102130/entropy.txt')
-entropy_GSE119926_PDX <- read.table('./GSE119926_2/entropy.txt')
-par(mar=c(10,4,4,0))
-boxplot(entropy_GSE131928$col_entropy,entropy_pediatric$col_entropy,entropy_GSE102130$col_entropy,entropy_GSE119926$col_entropy,entropy_GSE119926_PDX$col_entropy,entropy_GSE89567$col_entropy,entropy_GSE70630$col_entropy,names=c('GSE131928','GSE131928_pediatric','GSE102130','GSE119926','GSE119926_PDX','GSE89567','GSE70630'),main='Inter-tumor heterogenety',las=2) # col_entropy, the 
